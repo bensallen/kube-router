@@ -48,6 +48,7 @@ const (
 	peerIPAnnotation                   = "kube-router.io/peer.ips"
 	peerPasswordAnnotation             = "kube-router.io/peer.passwords"
 	peerPortAnnotation                 = "kube-router.io/peer.ports"
+	multiPathAnnotation                = "kube-router.io/multi-path"
 	rrClientAnnotation                 = "kube-router.io/rr.client"
 	rrServerAnnotation                 = "kube-router.io/rr.server"
 	svcLocalAnnotation                 = "kube-router.io/service.local"
@@ -108,6 +109,7 @@ type NetworkRoutingController struct {
 	pathPrepend             bool
 	localAddressList        []string
 	overrideNextHop         bool
+	enableMultiPath         bool
 
 	nodeLister cache.Indexer
 	svcLister  cache.Indexer
@@ -338,6 +340,7 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 
 func (nrc *NetworkRoutingController) watchBgpUpdates() {
 	watcher := nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
+
 	for {
 		select {
 		case ev := <-watcher.Event():
@@ -347,13 +350,27 @@ func (nrc *NetworkRoutingController) watchBgpUpdates() {
 				if nrc.MetricsEnabled {
 					metrics.ControllerBGPadvertisementsReceived.Inc()
 				}
-				for _, path := range msg.PathList {
-					if path.IsLocal() {
-						continue
+				if table.UseMultiplePaths.Enabled {
+					for _, paths := range msg.MultiPathList {
+						if paths[0].IsLocal() {
+							continue
+						}
+						if err := nrc.injectRoute(paths); err != nil {
+							glog.Errorf("Failed to inject routes due to: " + err.Error())
+							continue
+						}
 					}
-					if err := nrc.injectRoute(path); err != nil {
-						glog.Errorf("Failed to inject routes due to: " + err.Error())
-						continue
+
+				} else {
+
+					for _, path := range msg.PathList {
+						if path.IsLocal() {
+							continue
+						}
+						if err := nrc.injectRoute([]*table.Path{path}); err != nil {
+							glog.Errorf("Failed to inject routes due to: " + err.Error())
+							continue
+						}
 					}
 				}
 			}
@@ -405,35 +422,41 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 	return nil
 }
 
-func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
-	nexthop := path.GetNexthop()
-	nlri := path.GetNlri()
-	dst, _ := netlink.ParseIPNet(nlri.String())
+func (nrc *NetworkRoutingController) injectRoute(paths []*table.Path) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("Failed to inject routes, no paths passed")
+	}
+
 	var route *netlink.Route
+	var withdrawRoute bool
+	var sameSubnet bool
 
-	tunnelName := generateTunnelName(nexthop.String())
-	sameSubnet := nrc.nodeSubnet.Contains(nexthop)
+	// see if at least one path's nexthop is in the node's subnet.
+	for _, path := range paths {
+		nexthop := path.GetNexthop()
+		sameSubnet = nrc.nodeSubnet.Contains(nexthop)
+		if sameSubnet {
+			break
+		}
+	}
 
-	// cleanup route and tunnel if overlay is disabled or node is in same subnet and overlay-type is set to 'subnet'
+	// cleanup routes and tunnel if overlay is disabled or node is in same subnet and overlay-type is set to 'subnet'
 	if !nrc.enableOverlays || (sameSubnet && nrc.overlayType == "subnet") {
-		glog.Infof("Cleaning up old routes if there are any")
-		routes, err := netlink.RouteListFiltered(nl.FAMILY_ALL, &netlink.Route{
-			Dst: dst, Protocol: 0x11,
-		}, netlink.RT_FILTER_DST|netlink.RT_FILTER_PROTOCOL)
-		if err != nil {
-			glog.Errorf("Failed to get routes from netlink")
-		}
-		for i, r := range routes {
-			glog.V(2).Infof("Found route to remove: %s", r.String())
-			if err := netlink.RouteDel(&routes[i]); err != nil {
-				glog.Errorf("Failed to remove route due to " + err.Error())
+		for _, path := range paths {
+			nlri := path.GetNlri()
+			dst, err := netlink.ParseIPNet(nlri.String())
+			if err != nil {
+				glog.Errorf("Failed to cleanup route due to %s", err)
+				continue
 			}
-		}
 
-		glog.Infof("Cleaning up if there is any existing tunnel interface for the node")
-		if link, err := netlink.LinkByName(tunnelName); err == nil {
-			if err = netlink.LinkDel(link); err != nil {
-				glog.Errorf("Failed to delete tunnel link for the node due to " + err.Error())
+			if err := cleanupRoutes(dst); err != nil {
+				glog.Error(err)
+			}
+
+			tunnelName := generateTunnelName(path.GetNexthop().String())
+			if err := cleanupTunnelInterface(tunnelName); err != nil {
+				glog.Error(err)
 			}
 		}
 	}
@@ -441,70 +464,148 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 	// create IPIP tunnels only when node is not in same subnet or overlay-type is set to 'full'
 	// prevent creation when --override-nexthop=true as well
 	// if the user has disabled overlays, don't create tunnels
-	if (!sameSubnet || nrc.overlayType == "full") && !nrc.overrideNextHop && nrc.enableOverlays {
-		// create ip-in-ip tunnel and inject route as overlay is enabled
-		var link netlink.Link
+	if (!sameSubnet || nrc.overlayType == "full") && !nrc.overrideNextHop && nrc.enableOverlays && !table.UseMultiplePaths.Enabled {
 		var err error
-		link, err = netlink.LinkByName(tunnelName)
+		route, err = nrc.createTunnelInterface(paths[0])
 		if err != nil {
-			out, err := exec.Command("ip", "tunnel", "add", tunnelName, "mode", "ipip", "local", nrc.nodeIP.String(),
-				"remote", nexthop.String(), "dev", nrc.nodeInterface).CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("Route not injected for the route advertised by the node %s "+
-					"Failed to create tunnel interface %s. error: %s, output: %s",
-					nexthop.String(), tunnelName, err, string(out))
-			}
-
-			link, err = netlink.LinkByName(tunnelName)
-			if err != nil {
-				return fmt.Errorf("Route not injected for the route advertised by the node %s "+
-					"Failed to get tunnel interface by name error: %s", tunnelName, err)
-			}
-			if err := netlink.LinkSetUp(link); err != nil {
-				return errors.New("Failed to bring tunnel interface " + tunnelName + " up due to: " + err.Error())
-			}
-			// reduce the MTU by 20 bytes to accommodate ipip tunnel overhead
-			if err := netlink.LinkSetMTU(link, link.Attrs().MTU-20); err != nil {
-				return errors.New("Failed to set MTU of tunnel interface " + tunnelName + " up due to: " + err.Error())
-			}
-		} else {
-			glog.Infof("Tunnel interface: " + tunnelName + " for the node " + nexthop.String() + " already exists.")
-		}
-
-		out, err := exec.Command("ip", "route", "list", "table", customRouteTableID).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("Failed to verify if route already exists in %s table: %s",
-				customRouteTableName, err.Error())
-		}
-		if !strings.Contains(string(out), "dev "+tunnelName+" scope") {
-			if out, err = exec.Command("ip", "route", "add", nexthop.String(), "dev", tunnelName, "table",
-				customRouteTableID).CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to add route in custom route table, err: %s, output: %s", err, string(out))
-			}
-		}
-
-		route = &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Src:       nrc.nodeIP,
-			Dst:       dst,
-			Protocol:  0x11,
+			return err
 		}
 	} else if sameSubnet {
-		route = &netlink.Route{
-			Dst:      dst,
-			Gw:       nexthop,
-			Protocol: 0x11,
+		nlri := paths[0].GetNlri()
+		dst, _ := netlink.ParseIPNet(nlri.String())
+
+		if len(paths) > 1 {
+
+			var nextHops []*netlink.NexthopInfo
+			for _, path := range paths {
+				nexthop := path.GetNexthop()
+
+				if path.IsWithdraw || !nrc.nodeSubnet.Contains(nexthop) {
+					continue
+				}
+
+				nextHops = append(nextHops, &netlink.NexthopInfo{
+					Gw: nexthop,
+				})
+			}
+
+			// If there's no next hops then withdraw the route
+			if len(nextHops) == 0 {
+				withdrawRoute = true
+			}
+
+			route = &netlink.Route{
+				Dst:       dst,
+				MultiPath: nextHops,
+				Protocol:  0x11,
+			}
+		} else {
+			nexthop := paths[0].GetNexthop()
+
+			route = &netlink.Route{
+				Dst:      dst,
+				Gw:       nexthop,
+				Protocol: 0x11,
+			}
+			withdrawRoute = paths[0].IsWithdraw
 		}
 	} else {
 		return nil
 	}
 
-	if path.IsWithdraw {
-		glog.V(2).Infof("Removing route: '%s via %s' from peer in the routing table", dst, nexthop)
+	if withdrawRoute {
+		glog.V(2).Infof("Removing route: '%s' from peer in the routing table", route)
 		return netlink.RouteDel(route)
 	}
-	glog.V(2).Infof("Inject route: '%s via %s' from peer to routing table", dst, nexthop)
+	glog.V(2).Infof("Inject route: '%s' from peer to routing table", route)
 	return netlink.RouteReplace(route)
+}
+
+// createTunnelInterface creates an IP-IP tunnel based on the table path passed.
+func (nrc *NetworkRoutingController) createTunnelInterface(path *table.Path) (*netlink.Route, error) {
+	nexthop := path.GetNexthop()
+	nlri := path.GetNlri()
+	dst, _ := netlink.ParseIPNet(nlri.String())
+	var route *netlink.Route
+
+	tunnelName := generateTunnelName(nexthop.String())
+
+	// create ip-in-ip tunnel and inject route as overlay is enabled
+	var link netlink.Link
+	var err error
+	link, err = netlink.LinkByName(tunnelName)
+	if err != nil {
+		out, err := exec.Command("ip", "tunnel", "add", tunnelName, "mode", "ipip", "local", nrc.nodeIP.String(),
+			"remote", nexthop.String(), "dev", nrc.nodeInterface).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("Route not injected for the route advertised by the node %s "+
+				"Failed to create tunnel interface %s. error: %s, output: %s",
+				nexthop.String(), tunnelName, err, string(out))
+		}
+
+		link, err = netlink.LinkByName(tunnelName)
+		if err != nil {
+			return nil, fmt.Errorf("Route not injected for the route advertised by the node %s "+
+				"Failed to get tunnel interface by name error: %s", tunnelName, err)
+		}
+		if err := netlink.LinkSetUp(link); err != nil {
+			return nil, errors.New("Failed to bring tunnel interface " + tunnelName + " up due to: " + err.Error())
+		}
+		// reduce the MTU by 20 bytes to accommodate ipip tunnel overhead
+		if err := netlink.LinkSetMTU(link, link.Attrs().MTU-20); err != nil {
+			return nil, errors.New("Failed to set MTU of tunnel interface " + tunnelName + " up due to: " + err.Error())
+		}
+	} else {
+		glog.Infof("Tunnel interface: " + tunnelName + " for the node " + nexthop.String() + " already exists.")
+	}
+
+	out, err := exec.Command("ip", "route", "list", "table", customRouteTableID).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to verify if route already exists in %s table: %s",
+			customRouteTableName, err.Error())
+	}
+	if !strings.Contains(string(out), "dev "+tunnelName+" scope") {
+		if out, err = exec.Command("ip", "route", "add", nexthop.String(), "dev", tunnelName, "table",
+			customRouteTableID).CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("failed to add route in custom route table, err: %s, output: %s", err, string(out))
+		}
+	}
+
+	route = &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Src:       nrc.nodeIP,
+		Dst:       dst,
+		Protocol:  0x11,
+	}
+
+	return route, nil
+}
+
+func cleanupRoutes(dst *net.IPNet) error {
+	glog.Infof("Cleaning up old routes if there are any")
+	routes, err := netlink.RouteListFiltered(nl.FAMILY_ALL, &netlink.Route{
+		Dst: dst, Protocol: 0x11,
+	}, netlink.RT_FILTER_DST|netlink.RT_FILTER_PROTOCOL)
+	if err != nil {
+		return fmt.Errorf("Failed to get routes from netlink")
+	}
+	for i, r := range routes {
+		glog.V(2).Infof("Found route to remove: %s", r.String())
+		if err := netlink.RouteDel(&routes[i]); err != nil {
+			return fmt.Errorf("Failed to remove route due to " + err.Error())
+		}
+	}
+	return nil
+}
+
+func cleanupTunnelInterface(tunnelName string) error {
+	glog.Infof("Cleaning up if there is any existing tunnel interface for the node")
+	if link, err := netlink.LinkByName(tunnelName); err == nil {
+		if err = netlink.LinkDel(link); err != nil {
+			return fmt.Errorf("Failed to delete tunnel link for the node due to " + err.Error())
+		}
+	}
+	return nil
 }
 
 // Cleanup performs the cleanup of configurations done
@@ -720,6 +821,16 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 		nrc.pathPrepend = true
 		nrc.pathPrependAS = prependASN
 		nrc.pathPrependCount = uint8(repeatN)
+	}
+
+	if nodeMultiPathAnnotation, ok := node.ObjectMeta.Annotations[multiPathAnnotation]; ok {
+		nodeMultiPath, err := strconv.ParseBool(nodeMultiPathAnnotation)
+		if err != nil {
+			nrc.bgpServer.Stop()
+			return fmt.Errorf("Failed to parse node's Multi Path Annotation: %s", err)
+		}
+		glog.Infof("Enabling multipath route support.")
+		table.UseMultiplePaths.Enabled = nodeMultiPath
 	}
 
 	nrc.bgpServer = gobgp.NewBgpServer()
